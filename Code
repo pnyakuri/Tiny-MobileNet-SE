@@ -1,0 +1,247 @@
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, DepthwiseConv2D, GlobalAveragePooling2D, Dense, Dropout, MaxPooling2D, Input, Reshape, Multiply, BatchNormalization, Activation
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.metrics import classification_report
+import numpy as np
+import os
+
+# SE Block
+def se_block(input_tensor, reduction_ratio=16):
+    channel_axis = -1
+    filters = input_tensor.shape[channel_axis]
+
+    se_shape = (1, 1, filters)
+
+    se = GlobalAveragePooling2D()(input_tensor)
+    se = Reshape(se_shape)(se)
+    se = Dense(filters // reduction_ratio, activation='relu', kernel_initializer='he_normal', use_bias=False)(se)
+    se = Dense(filters, activation='sigmoid', kernel_initializer='he_normal', use_bias=False)(se)
+
+    x = Multiply()([input_tensor, se])
+    return x
+
+# Define the teacher model (MobileNetV2)
+def mobilenetv2(input_shape=(224, 224, 3), num_classes=3):
+    base_model = tf.keras.applications.MobileNetV2(input_shape=input_shape, include_top=False, weights='imagenet')
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(128, activation='relu')(x)
+    output_tensor = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs=base_model.input, outputs=output_tensor)
+    return model
+
+# Define a more complex student model with SE blocks, BatchNormalization, and Depthwise Separable Convolutions
+def student_model_with_se_bn(input_shape=(224, 224, 3), num_classes=3):
+    input_tensor = Input(shape=input_shape)
+    # First block
+    x = DepthwiseConv2D((3, 3), padding='same')(input_tensor)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(32, (1, 1), padding='same')(x)  # Pointwise convolution
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Second block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(64, (1, 1), padding='same')(x)  # Pointwise convolution
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Third block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(128, (1, 1), padding='same')(x)  # Pointwise convolution
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Fourth block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(256, (1, 1), padding='same')(x)  # Pointwise convolution
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = se_block(x)
+
+    # Fifth block
+    x = DepthwiseConv2D((3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(512, (1, 1), padding='same')(x)  # Pointwise convolution
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(512, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    output_tensor = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs=input_tensor, outputs=output_tensor)
+    return model
+
+# Custom training step with knowledge distillation
+class DistilledStudentModel(tf.keras.Model):
+    def __init__(self, student, teacher, temperature=10.0, alpha=0.35):
+        super(DistilledStudentModel, self).__init__()
+        self.student = student
+        self.teacher = teacher
+        self.temperature = temperature
+        self.alpha = alpha
+    
+    def compile(self, optimizer, loss_fn, metrics):
+        super(DistilledStudentModel, self).compile(optimizer=optimizer, metrics=metrics)
+        self.loss_fn = loss_fn
+    
+    def call(self, inputs, training=False):
+        return self.student(inputs, training=training)
+    
+    def train_step(self, data):
+        x, y = data
+
+        with tf.GradientTape() as tape:
+            teacher_pred = self.teacher(x, training=False)
+            student_pred = self.student(x, training=True)
+            
+            # Compute losses
+            loss = self.loss_fn(y, student_pred)
+            teacher_pred_soft = tf.nn.softmax(teacher_pred / self.temperature)
+            student_pred_soft = tf.nn.softmax(student_pred / self.temperature)
+            distillation_loss = tf.keras.losses.KLDivergence()(teacher_pred_soft, student_pred_soft)
+            distillation_loss = tf.reduce_mean(distillation_loss)
+            combined_loss = self.alpha * loss + (1 - self.alpha) * distillation_loss
+
+        # Compute gradients
+        trainable_vars = self.student.trainable_variables
+        gradients = tape.gradient(combined_loss, trainable_vars)
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        
+        self.compiled_metrics.update_state(y, student_pred)
+        return {m.name: m.result() for m in self.metrics}
+
+    def test_step(self, data):
+        x, y = data
+        y_pred = self(x, training=False)
+        loss = self.loss_fn(y, y_pred)
+        self.compiled_metrics.update_state(y, y_pred)
+        return {m.name: m.result() for m in self.metrics}
+
+# Main script to train the models
+def main():
+    # Define directories for training and validation data
+    base_dir = "/content/dataset/agingclass3333"
+    train_dir = os.path.join(base_dir, "train")
+    validation_dir = os.path.join(base_dir, "val")
+
+    # Data Augmentation
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=40,
+        width_shift_range=0.3,
+        height_shift_range=0.3,
+        shear_range=0.3,
+        zoom_range=0.3,
+        brightness_range=[0.8, 1.2],  # Added brightness augmentation
+        horizontal_flip=True,
+        fill_mode='nearest'
+    )
+
+    validation_datagen = ImageDataGenerator(rescale=1./255)
+
+    # Load data
+    train_generator = train_datagen.flow_from_directory(
+        train_dir,
+        target_size=(224, 224),
+        batch_size=32,
+        class_mode='categorical'
+    )
+
+    validation_generator = validation_datagen.flow_from_directory(
+        validation_dir,
+        target_size=(224, 224),
+        batch_size=32,
+        class_mode='categorical'
+    )
+
+    # Create and compile teacher model
+    teacher_model = mobilenetv2()
+    teacher_model.compile(optimizer=Adam(learning_rate=1e-4),
+                          loss='categorical_crossentropy',
+                          metrics=['accuracy'])
+
+    # Train the teacher model
+    teacher_model.fit(train_generator,
+                      steps_per_epoch=train_generator.samples // train_generator.batch_size,
+                      epochs=100,
+                      validation_data=validation_generator,
+                      validation_steps=validation_generator.samples // validation_generator.batch_size)
+
+    # Save the teacher model
+    teacher_model_path = "/content/model/teacher_Model.h5"
+    teacher_model.save(teacher_model_path)
+
+    # Load the teacher model
+    teacher_model = tf.keras.models.load_model(teacher_model_path)
+
+    # Create the student model with SE blocks and BatchNormalization
+    student = student_model_with_se_bn()
+
+    # Create the distilled student model
+    distilled_student = DistilledStudentModel(student, teacher_model, temperature=10.0, alpha=0.5)
+    distilled_student.compile(
+        optimizer=Adam(learning_rate=1e-4),
+        loss_fn=tf.keras.losses.CategoricalCrossentropy(),
+        metrics=['accuracy']
+    )
+
+    # Train the distilled student model
+    distilled_student.fit(train_generator,
+                          steps_per_epoch=train_generator.samples // train_generator.batch_size,
+                          epochs=200,
+                          validation_data=validation_generator,
+                          validation_steps=validation_generator.samples // validation_generator.batch_size)
+
+    # Save the student model with training configuration
+    student_model_path = "/content/model/student_Model.h5"
+    student.save(student_model_path)
+
+    # Load the student model and compile it
+    student = tf.keras.models.load_model(student_model_path)
+    student.compile(optimizer=Adam(learning_rate=1e-4),
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy'])
+
+    # Evaluate the student model
+    accuracy = student.evaluate(validation_generator)[1]
+    print("Student Model Accuracy:", accuracy)
+
+    # Calculate model size and parameters
+    model_size = sum(tf.size(p).numpy() for p in student.trainable_weights)
+    total_params = student.count_params()
+    trainable_params = sum(tf.size(p).numpy() for p in student.trainable_weights)
+    non_trainable_params = sum(tf.size(p).numpy() for p in student.non_trainable_weights)
+
+    print(f"Model Size: {model_size / 1e6:.2f} MB")
+    print(f"Total Params: {total_params}")
+    print(f"Trainable Params: {trainable_params}")
+    print(f"Non-trainable Params: {non_trainable_params}")
+
+    # Calculate additional metrics
+    validation_generator.reset()
+    predictions = student.predict(validation_generator, steps=validation_generator.samples // validation_generator.batch_size)
+    y_pred = np.argmax(predictions, axis=1)
+    y_true = validation_generator.classes[:len(y_pred)]
+    print("Classification Report:\n", classification_report(y_true, y_pred))
+
+if __name__ == "__main__":
+    main()
